@@ -2,6 +2,9 @@
 name = "ha-core"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jethac/ha-core"
+description = "Headless Rust client for the Home Assistant WebSocket API"
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["serde", "std", "clock"] }
