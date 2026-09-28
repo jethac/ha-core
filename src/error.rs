@@ -19,6 +19,9 @@ pub enum Error {
     Ha { code: String, message: String },
     #[error("connection to Home Assistant closed")]
     Disconnected,
+    /// `connect` exceeded its deadline before the handshake finished.
+    #[error("timed out connecting to Home Assistant")]
+    Timeout,
 }
 
 impl From<tungstenite::Error> for Error {

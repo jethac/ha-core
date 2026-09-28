@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -45,11 +46,30 @@ struct Routes {
 }
 
 impl HaClient {
+    /// Deadline for one connect attempt: TCP, TLS, the WebSocket upgrade and
+    /// the auth handshake. Override with [`HaClient::builder`].
+    pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
     /// Connects and authenticates with a long-lived access token.
     ///
     /// `url` may be the instance's base URL (`http://homeassistant.local:8123`)
     /// or the full WebSocket endpoint (`wss://…/api/websocket`).
+    ///
+    /// The attempt is bounded by [`Self::DEFAULT_CONNECT_TIMEOUT`]; a host
+    /// that accepts packets but never answers fails with [`Error::Timeout`]
+    /// instead of hanging, so a caller's retry loop still runs.
     pub async fn connect(url: &str, access_token: &str) -> Result<Self> {
+        Self::builder().connect(url, access_token).await
+    }
+
+    /// Returns a builder for overriding connect options such as the deadline.
+    pub fn builder() -> HaClientBuilder {
+        HaClientBuilder {
+            connect_timeout: Self::DEFAULT_CONNECT_TIMEOUT,
+        }
+    }
+
+    async fn connect_inner(url: &str, access_token: &str) -> Result<Self> {
         let url = websocket_url(url)?;
         let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str()).await?;
 
@@ -263,6 +283,37 @@ impl HaClient {
             .out
             .send(Message::text(msg.to_string()))
             .map_err(|_| Error::Disconnected)
+    }
+}
+
+/// Builds a [`HaClient`]; created by [`HaClient::builder`].
+#[derive(Debug, Clone)]
+pub struct HaClientBuilder {
+    connect_timeout: Duration,
+}
+
+impl Default for HaClientBuilder {
+    fn default() -> Self {
+        HaClient::builder()
+    }
+}
+
+impl HaClientBuilder {
+    /// How long one connect attempt may take before it fails with
+    /// [`Error::Timeout`]. Defaults to [`HaClient::DEFAULT_CONNECT_TIMEOUT`].
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    /// Connects and authenticates; see [`HaClient::connect`].
+    pub async fn connect(self, url: &str, access_token: &str) -> Result<HaClient> {
+        tokio::time::timeout(
+            self.connect_timeout,
+            HaClient::connect_inner(url, access_token),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
     }
 }
 

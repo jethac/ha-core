@@ -1,5 +1,7 @@
 //! End-to-end tests against a scripted stand-in for Home Assistant's WebSocket API.
 
+use std::time::{Duration, Instant};
+
 use futures_util::{SinkExt, StreamExt};
 use ha_core::{EntityChange, Error, HaClient, Target};
 use serde_json::{Value, json};
@@ -16,6 +18,34 @@ async fn mock_home_assistant() -> String {
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         serve(tokio_tungstenite::accept_async(stream).await.unwrap()).await;
+    });
+    format!("http://{addr}")
+}
+
+/// A black hole: accepts the TCP connection, then never speaks.
+async fn silent_tcp() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    format!("http://{addr}")
+}
+
+/// Completes the WebSocket upgrade and sends `auth_required`, then goes silent.
+async fn stalls_after_auth_required() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        send(
+            &mut ws,
+            json!({"type": "auth_required", "ha_version": "2026.9.0"}),
+        )
+        .await;
+        std::future::pending::<()>().await;
     });
     format!("http://{addr}")
 }
@@ -126,6 +156,26 @@ async fn authenticates_and_queries() {
     let states = client.get_states().await.unwrap();
     assert_eq!(states.len(), 1);
     assert_eq!(states[0].name(), "Kitchen");
+}
+
+#[tokio::test]
+async fn connect_times_out_when_tcp_never_answers() {
+    let start = Instant::now();
+    let result = HaClient::builder()
+        .connect_timeout(Duration::from_millis(100))
+        .connect(&silent_tcp().await, TOKEN)
+        .await;
+    assert!(matches!(result, Err(Error::Timeout)));
+    assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+#[tokio::test]
+async fn connect_times_out_when_auth_stalls() {
+    let result = HaClient::builder()
+        .connect_timeout(Duration::from_millis(100))
+        .connect(&stalls_after_auth_required().await, TOKEN)
+        .await;
+    assert!(matches!(result, Err(Error::Timeout)));
 }
 
 #[tokio::test]

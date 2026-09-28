@@ -26,7 +26,7 @@ mod error;
 mod protocol;
 mod registry;
 
-pub use client::{EntityWatcher, HaClient, Subscription, Target};
+pub use client::{EntityWatcher, HaClient, HaClientBuilder, Subscription, Target};
 pub use entities::{EntityChange, EntityState, EntityStore, domain_of};
 pub use error::{Error, Result};
 pub use registry::{AreaEntry, DeviceEntry, EntityRegistryEntry};
