@@ -104,6 +104,15 @@ impl EntityStore {
         self.entities.is_empty()
     }
 
+    /// Empties the mirror, reporting every entity it held as removed.
+    /// Used when a reconnect means the next snapshot rebuilds from scratch.
+    pub fn clear(&mut self) -> Vec<EntityChange> {
+        self.entities
+            .drain()
+            .map(|(entity_id, _)| EntityChange::Removed(entity_id))
+            .collect()
+    }
+
     /// Applies one `subscribe_entities` event (the compressed format:
     /// `a` = full states, `c` = diffs, `r` = removals) and reports what changed.
     pub fn apply_compressed(&mut self, event: &Value) -> Result<Vec<EntityChange>> {

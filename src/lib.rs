@@ -5,7 +5,9 @@
 //! - one-shot commands ([`HaClient::get_states`], [`HaClient::call_service`], registries),
 //! - raw event subscriptions ([`HaClient::subscribe_events`]),
 //! - a live entity mirror ([`HaClient::watch_entities`]) built on `subscribe_entities`,
-//!   which yields batches of [`EntityChange`]s that a front end can apply to its models.
+//!   which yields batches of [`EntityChange`]s that a front end can apply to its models,
+//! - opt-in reconnect: [`HaClient::connect_with_retry`] re-dials with capped
+//!   exponential backoff and re-issues live subscriptions after each drop.
 //!
 //! ```no_run
 //! # async fn demo() -> ha_core::Result<()> {
@@ -26,7 +28,7 @@ mod error;
 mod protocol;
 mod registry;
 
-pub use client::{EntityWatcher, HaClient, HaClientBuilder, Subscription, Target};
+pub use client::{EntityWatcher, HaClient, HaClientBuilder, RetryPolicy, Subscription, Target};
 pub use entities::{EntityChange, EntityState, EntityStore, domain_of};
 pub use error::{Error, Result};
 pub use registry::{AreaEntry, DeviceEntry, EntityRegistryEntry};
