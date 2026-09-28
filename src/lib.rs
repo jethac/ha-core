@@ -9,7 +9,9 @@
 //! - opt-in reconnect: [`HaClient::connect_with_retry`] re-dials with capped
 //!   exponential backoff and re-issues live subscriptions after each drop.
 //!   Pass a [`TokenProvider`] instead of a `&str` token to refresh expiring
-//!   OAuth access tokens between attempts.
+//!   OAuth access tokens between attempts. [`HaClient::connection_state`]
+//!   streams [`ConnectionState`] so a caller can tell a blip from a dead
+//!   credential.
 //!
 //! ```no_run
 //! # async fn demo() -> ha_core::Result<()> {
@@ -31,7 +33,8 @@ mod protocol;
 mod registry;
 
 pub use client::{
-    EntityWatcher, HaClient, HaClientBuilder, RetryPolicy, Subscription, Target, TokenProvider,
+    ConnectionState, EntityWatcher, HaClient, HaClientBuilder, RetryPolicy, Subscription, Target,
+    TokenProvider,
 };
 pub use entities::{EntityChange, EntityState, EntityStore, domain_of};
 pub use error::{Error, Result};
