@@ -3,7 +3,7 @@
 Headless Rust client for the [Home Assistant WebSocket API](https://developers.home-assistant.io/docs/api/websocket).
 It has no UI dependencies, so a front end (such as a Slint dashboard) can consume it through plain Rust types.
 
-- Connects and authenticates with a long-lived access token. Takes `http(s)://host:8123` or a `ws(s)://…/api/websocket` URL.
+- Connects and authenticates with a long-lived access token. Takes `http(s)://host:8123` or a `ws(s)://…/api/websocket` URL. Each connect attempt is bounded by a 30-second deadline (`HaClient::builder().connect_timeout(...)` to change it), so a black-holed host fails with `Error::Timeout` instead of hanging.
 - `HaClient::connect_with_retry` reconnects with capped exponential backoff and re-issues live subscriptions after every reconnect; `HaClient::connect` keeps the raw contract where a dropped socket fails calls with `Error::Disconnected`.
 - Commands: `get_states`, `get_config`, `get_services`, `call_service`, `turn_on` / `turn_off` / `toggle`, and the area, device and entity registries.
 - Live state: `watch_entities` wraps `subscribe_entities`. It keeps an `EntityStore` mirror and yields `Added` / `Updated` / `Removed` batches.

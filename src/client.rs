@@ -142,15 +142,34 @@ enum ConnEnd {
 }
 
 impl HaClient {
+    /// Deadline for one connect attempt: TCP, TLS, the WebSocket upgrade and
+    /// the auth handshake. Override with [`HaClient::builder`].
+    pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
     /// Connects and authenticates with a long-lived access token.
     ///
     /// `url` may be the instance's base URL (`http://homeassistant.local:8123`)
     /// or the full WebSocket endpoint (`wss://…/api/websocket`).
+    ///
+    /// The attempt is bounded by [`Self::DEFAULT_CONNECT_TIMEOUT`]; a host
+    /// that accepts packets but never answers fails with [`Error::Timeout`]
+    /// instead of hanging, so a caller's retry loop still runs.
     pub async fn connect(url: &str, access_token: &str) -> Result<Self> {
+        Self::builder().connect(url, access_token).await
+    }
+
+    /// Returns a builder for overriding connect options such as the deadline.
+    pub fn builder() -> HaClientBuilder {
+        HaClientBuilder {
+            connect_timeout: Self::DEFAULT_CONNECT_TIMEOUT,
+        }
+    }
+
+    async fn connect_inner(url: &str, access_token: &str, deadline: Duration) -> Result<Self> {
         let url = websocket_url(url)?;
-        let (ws, ha_version) = handshake(&url, access_token).await?;
+        let (ws, ha_version) = handshake(&url, access_token, deadline).await?;
         let client = Self::assemble(ws, ha_version, None);
-        client.negotiate_features().await;
+        client.negotiate_features(deadline).await;
         Ok(client)
     }
 
@@ -163,6 +182,11 @@ impl HaClient {
     /// previous state as [`EntityChange::Removed`] before yielding the fresh
     /// snapshot, so consumers see a resync rather than silently stale data.
     ///
+    /// Every attempt, initial or reconnect, is bounded by
+    /// [`Self::DEFAULT_CONNECT_TIMEOUT`]. A host that stops answering counts
+    /// as a failed attempt and is retried; it never stalls the loop. Use
+    /// [`HaClientBuilder::connect_with_retry`] to change the deadline.
+    ///
     /// [`Error::AuthInvalid`] is never retried: a wrong token is returned
     /// immediately here, and on reconnect it stops the client for good.
     pub async fn connect_with_retry(
@@ -170,32 +194,9 @@ impl HaClient {
         access_token: &str,
         policy: RetryPolicy,
     ) -> Result<Self> {
-        let url = websocket_url(url)?;
-        let mut backoff = policy.backoff();
-        loop {
-            match handshake(&url, access_token).await {
-                Ok((ws, ha_version)) => {
-                    let (done, done_rx) = oneshot::channel();
-                    let client = Self::assemble(ws, ha_version, Some(done));
-                    tokio::spawn(supervise(
-                        Arc::downgrade(&client.shared),
-                        url.clone(),
-                        access_token.to_owned(),
-                        policy,
-                        done_rx,
-                    ));
-                    client.negotiate_features().await;
-                    return Ok(client);
-                }
-                // A bad token can never succeed; everything else may.
-                Err(e @ Error::AuthInvalid(_)) => return Err(e),
-                Err(e) => {
-                    let delay = backoff.next().unwrap_or(policy.max);
-                    tracing::warn!("connect failed: {e}; retrying in {delay:?}");
-                    tokio::time::sleep(delay).await;
-                }
-            }
-        }
+        Self::builder()
+            .connect_with_retry(url, access_token, policy)
+            .await
     }
 
     /// Builds the shared state and spawns the connection's I/O task.
@@ -216,10 +217,14 @@ impl HaClient {
     }
 
     /// Lets Home Assistant batch messages into JSON arrays; older versions reject it.
-    async fn negotiate_features(&self) {
+    /// Best effort, and bounded so a server that stalls after auth cannot
+    /// hold a connect or reconnect open.
+    async fn negotiate_features(&self, deadline: Duration) {
         let features = json!({"type": "supported_features", "features": {"coalesce_messages": 1}});
-        if let Err(e) = self.command(features).await {
-            tracing::debug!("message coalescing unavailable: {e}");
+        match tokio::time::timeout(deadline, self.command(features)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::debug!("message coalescing unavailable: {e}"),
+            Err(_) => tracing::debug!("message coalescing negotiation timed out"),
         }
     }
 
@@ -425,6 +430,75 @@ impl HaClient {
     }
 }
 
+/// Builds a [`HaClient`]; created by [`HaClient::builder`].
+#[derive(Debug, Clone)]
+pub struct HaClientBuilder {
+    connect_timeout: Duration,
+}
+
+impl Default for HaClientBuilder {
+    fn default() -> Self {
+        HaClient::builder()
+    }
+}
+
+impl HaClientBuilder {
+    /// How long one connect attempt may take before it fails with
+    /// [`Error::Timeout`]. Defaults to [`HaClient::DEFAULT_CONNECT_TIMEOUT`].
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    /// Connects and authenticates; see [`HaClient::connect`].
+    pub async fn connect(self, url: &str, access_token: &str) -> Result<HaClient> {
+        tokio::time::timeout(
+            self.connect_timeout,
+            HaClient::connect_inner(url, access_token, self.connect_timeout),
+        )
+        .await
+        .map_err(|_| Error::Timeout)?
+    }
+
+    /// Connects with automatic reconnect; see [`HaClient::connect_with_retry`].
+    /// Each attempt is bounded by this builder's connect timeout.
+    pub async fn connect_with_retry(
+        self,
+        url: &str,
+        access_token: &str,
+        policy: RetryPolicy,
+    ) -> Result<HaClient> {
+        let deadline = self.connect_timeout;
+        let url = websocket_url(url)?;
+        let mut backoff = policy.backoff();
+        loop {
+            match handshake(&url, access_token, deadline).await {
+                Ok((ws, ha_version)) => {
+                    let (done, done_rx) = oneshot::channel();
+                    let client = HaClient::assemble(ws, ha_version, Some(done));
+                    tokio::spawn(supervise(
+                        Arc::downgrade(&client.shared),
+                        url.clone(),
+                        access_token.to_owned(),
+                        policy,
+                        deadline,
+                        done_rx,
+                    ));
+                    client.negotiate_features(deadline).await;
+                    return Ok(client);
+                }
+                // A bad token can never succeed; everything else may.
+                Err(e @ Error::AuthInvalid(_)) => return Err(e),
+                Err(e) => {
+                    let delay = backoff.next().unwrap_or(policy.max);
+                    tracing::warn!("connect failed: {e}; retrying in {delay:?}");
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+}
+
 /// Entities, devices and/or areas a service call acts on.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Target {
@@ -626,6 +700,7 @@ async fn supervise(
     url: Url,
     access_token: String,
     policy: RetryPolicy,
+    connect_timeout: Duration,
     mut done: oneshot::Receiver<ConnEnd>,
 ) {
     let routes = match weak.upgrade() {
@@ -651,7 +726,7 @@ async fn supervise(
             let Some(shared) = weak.upgrade() else {
                 return;
             };
-            match handshake(&url, &access_token).await {
+            match handshake(&url, &access_token, connect_timeout).await {
                 Ok((ws, ha_version)) => {
                     *shared.ha_version.write().unwrap() = ha_version;
                     let (out, out_rx) = mpsc::unbounded_channel();
@@ -660,7 +735,7 @@ async fn supervise(
                     routes.lock().unwrap().closed = false;
                     tokio::spawn(run_connection(ws, out_rx, routes.clone(), Some(done_tx)));
                     let client = HaClient { shared };
-                    client.negotiate_features().await;
+                    client.negotiate_features(connect_timeout).await;
                     resubscribe(&client).await;
                     tracing::info!("reconnected to Home Assistant");
                     done = done_rx;
@@ -792,8 +867,19 @@ fn dispatch(routes: &Mutex<Routes>, text: &str) {
     }
 }
 
-/// Opens the socket and runs the auth handshake; nothing is spawned yet.
-async fn handshake(url: &Url, access_token: &str) -> Result<(WsStream, String)> {
+/// Opens the socket and runs the auth handshake within `deadline`, failing
+/// with [`Error::Timeout`] past it; nothing is spawned yet.
+async fn handshake(
+    url: &Url,
+    access_token: &str,
+    deadline: Duration,
+) -> Result<(WsStream, String)> {
+    tokio::time::timeout(deadline, open_and_authenticate(url, access_token))
+        .await
+        .map_err(|_| Error::Timeout)?
+}
+
+async fn open_and_authenticate(url: &Url, access_token: &str) -> Result<(WsStream, String)> {
     let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str()).await?;
 
     match next_incoming(&mut ws).await? {

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use ha_core::{EntityChange, Error, HaClient, RetryPolicy, Target};
@@ -20,6 +20,34 @@ async fn mock_home_assistant() -> String {
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         serve(tokio_tungstenite::accept_async(stream).await.unwrap()).await;
+    });
+    format!("http://{addr}")
+}
+
+/// A black hole: accepts the TCP connection, then never speaks.
+async fn silent_tcp() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (_stream, _) = listener.accept().await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    format!("http://{addr}")
+}
+
+/// Completes the WebSocket upgrade and sends `auth_required`, then goes silent.
+async fn stalls_after_auth_required() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+        send(
+            &mut ws,
+            json!({"type": "auth_required", "ha_version": "2026.9.0"}),
+        )
+        .await;
+        std::future::pending::<()>().await;
     });
     format!("http://{addr}")
 }
@@ -237,6 +265,26 @@ async fn authenticates_and_queries() {
 }
 
 #[tokio::test]
+async fn connect_times_out_when_tcp_never_answers() {
+    let start = Instant::now();
+    let result = HaClient::builder()
+        .connect_timeout(Duration::from_millis(100))
+        .connect(&silent_tcp().await, TOKEN)
+        .await;
+    assert!(matches!(result, Err(Error::Timeout)));
+    assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+#[tokio::test]
+async fn connect_times_out_when_auth_stalls() {
+    let result = HaClient::builder()
+        .connect_timeout(Duration::from_millis(100))
+        .connect(&stalls_after_auth_required().await, TOKEN)
+        .await;
+    assert!(matches!(result, Err(Error::Timeout)));
+}
+
+#[tokio::test]
 async fn rejects_bad_token() {
     let result = HaClient::connect(&mock_home_assistant().await, "wrong").await;
     assert!(matches!(result, Err(Error::AuthInvalid(m)) if m == "Invalid access token"));
@@ -286,6 +334,29 @@ async fn explicit_unsubscribe() {
 }
 
 /// Quick retries for tests instead of the seconds-scale defaults.
+/// Serves each connection with `serve_reconnectable`, except the ones whose
+/// 0-based index is in `stalls`: those send `auth_required` and go silent.
+async fn mock_stalling_home_assistant(stalls: &'static [usize]) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut index = 0;
+        while let Ok((stream, _)) = listener.accept().await {
+            let stall = stalls.contains(&index);
+            index += 1;
+            tokio::spawn(async move {
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                if stall {
+                    send(&mut ws, json!({"type": "auth_required"})).await;
+                    std::future::pending::<()>().await;
+                }
+                serve_reconnectable(ws).await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
 fn fast_retry() -> RetryPolicy {
     RetryPolicy {
         start: Duration::from_millis(10),
@@ -331,4 +402,41 @@ async fn retry_retries_the_initial_connect() {
             .await
             .unwrap();
     client.ping().await.unwrap();
+}
+
+/// Without a deadline on each attempt, a stalled host would hang the retry
+/// loop forever: the failure #2 fixed for `connect`.
+#[tokio::test]
+async fn retry_gives_up_on_a_stalled_initial_attempt() {
+    let url = mock_stalling_home_assistant(&[0]).await;
+    let connect = HaClient::builder()
+        .connect_timeout(Duration::from_millis(100))
+        .connect_with_retry(&url, TOKEN, fast_retry());
+    let client = tokio::time::timeout(Duration::from_secs(5), connect)
+        .await
+        .expect("retry loop stalled on an unresponsive host")
+        .unwrap();
+    client.ping().await.unwrap();
+}
+
+#[tokio::test]
+async fn reconnect_gives_up_on_a_stalled_attempt() {
+    // Connection 0 serves (and drops after a ping), 1 stalls, 2 serves.
+    let url = mock_stalling_home_assistant(&[1]).await;
+    let client = HaClient::builder()
+        .connect_timeout(Duration::from_millis(100))
+        .connect_with_retry(&url, TOKEN, fast_retry())
+        .await
+        .unwrap();
+    let mut watcher = client.watch_entities(None).await.unwrap();
+    watcher.next().await.unwrap().unwrap();
+    client.ping().await.unwrap();
+
+    let resynced = tokio::time::timeout(Duration::from_secs(5), async {
+        watcher.next().await.unwrap().unwrap(); // stale state removed
+        watcher.next().await.unwrap().unwrap() // fresh snapshot
+    })
+    .await
+    .expect("supervisor stalled on an unresponsive reconnect");
+    assert!(matches!(&resynced[..], [EntityChange::Added(s)] if s.is_on()));
 }
