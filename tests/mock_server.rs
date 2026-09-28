@@ -5,9 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use ha_core::{EntityChange, Error, HaClient, RetryPolicy, Target, TokenProvider};
+use ha_core::{ConnectionState, EntityChange, Error, HaClient, RetryPolicy, Target, TokenProvider};
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -646,4 +647,149 @@ async fn reconnect_refusal_with_no_fresh_token_stops_the_client() {
         "a refused reconnect must stop the client"
     );
     assert_eq!(presented.lock().unwrap()[..], [TOKEN, TOKEN]);
+}
+
+/// Waits for a connection state satisfying `pred`, failing after 5s.
+async fn await_state(
+    states: &mut watch::Receiver<ConnectionState>,
+    what: &str,
+    pred: impl Fn(&ConnectionState) -> bool,
+) {
+    let seen = tokio::time::timeout(Duration::from_secs(5), states.wait_for(pred)).await;
+    match seen.map(|r| r.map(drop)) {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => panic!("state channel closed before {what}"),
+        Err(_) => panic!("timed out waiting for {what}: {:?}", states.borrow()),
+    }
+}
+
+/// A retrying client publishes `Reconnecting` while it re-dials — each failed
+/// attempt included — and `Connected` once the new session is up.
+#[tokio::test]
+async fn state_reports_reconnecting_then_connected() {
+    // Connections 1 and 2 stall after auth_required, so two reconnect
+    // attempts fail with a timeout before connection 3 serves.
+    let url = mock_stalling_home_assistant(&[1, 2]).await;
+    let client = HaClient::builder()
+        .connect_timeout(Duration::from_millis(100))
+        .connect_with_retry(&url, TOKEN, fast_retry())
+        .await
+        .unwrap();
+    let mut states = client.connection_state();
+    assert!(matches!(*states.borrow(), ConnectionState::Connected));
+
+    client.ping().await.unwrap(); // answers, then drops the socket
+
+    await_state(&mut states, "Reconnecting", |s| {
+        matches!(s, ConnectionState::Reconnecting { .. })
+    })
+    .await;
+    await_state(&mut states, "a failed attempt", |s| {
+        matches!(
+            s,
+            ConnectionState::Reconnecting {
+                attempt,
+                last_error: Error::Timeout
+            } if *attempt >= 1
+        )
+    })
+    .await;
+    await_state(&mut states, "Connected", |s| {
+        matches!(s, ConnectionState::Connected)
+    })
+    .await;
+    client.toggle("light.kitchen").await.unwrap();
+}
+
+/// A refused reconnect publishes the terminal `AuthRejected`.
+#[tokio::test]
+async fn state_reports_auth_rejected() {
+    let (url, valid, _presented) = mock_rotating_auth_home_assistant(TOKEN).await;
+    let client = HaClient::connect_with_retry(&url, TOKEN, fast_retry())
+        .await
+        .unwrap();
+    let mut states = client.connection_state();
+
+    client.ping().await.unwrap(); // answers, then drops the socket
+    *valid.lock().unwrap() = "rotated".to_owned(); // TOKEN is refused now
+
+    await_state(&mut states, "AuthRejected", |s| {
+        matches!(s, ConnectionState::AuthRejected(Error::AuthInvalid(_)))
+    })
+    .await;
+    assert!(
+        matches!(client.ping().await, Err(Error::Disconnected)),
+        "a refused reconnect must stop the client"
+    );
+}
+
+/// A provider that keeps failing shows up as `Error::TokenProvider` in
+/// `Reconnecting.last_error`, so a caller can treat it as needing sign-in.
+#[tokio::test]
+async fn state_surfaces_provider_failures() {
+    let (url, _connections) = mock_reconnectable_home_assistant().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counting = calls.clone();
+    let provider = TokenProvider::new(move || {
+        let n = counting.fetch_add(1, Ordering::Relaxed);
+        async move {
+            if n == 0 {
+                Ok(TOKEN.to_owned())
+            } else {
+                Err(std::io::Error::other("refresh token revoked"))
+            }
+        }
+    });
+    let client = HaClient::connect_with_retry(&url, provider, fast_retry())
+        .await
+        .unwrap();
+    let mut states = client.connection_state();
+
+    client.ping().await.unwrap(); // answers, then drops the socket
+
+    await_state(&mut states, "Reconnecting with a provider error", |s| {
+        matches!(
+            s,
+            ConnectionState::Reconnecting {
+                attempt,
+                last_error: Error::TokenProvider(_)
+            } if *attempt >= 1
+        )
+    })
+    .await;
+}
+
+/// A non-retrying client reports `Connected`, then `Stopped` when the
+/// socket dies.
+#[tokio::test]
+async fn plain_client_reports_stopped_when_socket_drops() {
+    let (url, _connections) = mock_reconnectable_home_assistant().await;
+    let client = HaClient::connect(&url, TOKEN).await.unwrap();
+    let mut states = client.connection_state();
+    assert!(matches!(*states.borrow(), ConnectionState::Connected));
+
+    client.ping().await.unwrap(); // answers, then the server closes
+
+    await_state(&mut states, "Stopped", |s| {
+        matches!(s, ConnectionState::Stopped)
+    })
+    .await;
+}
+
+/// A receiver subscribed before the last handle is dropped still sees the
+/// terminal `Stopped`.
+#[tokio::test]
+async fn state_reports_stopped_when_handles_drop() {
+    let (url, _connections) = mock_reconnectable_home_assistant().await;
+    let client = HaClient::connect_with_retry(&url, TOKEN, fast_retry())
+        .await
+        .unwrap();
+    let mut states = client.connection_state();
+
+    drop(client);
+
+    await_state(&mut states, "Stopped", |s| {
+        matches!(s, ConnectionState::Stopped)
+    })
+    .await;
 }

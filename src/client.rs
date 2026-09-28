@@ -11,7 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use url::Url;
@@ -53,6 +53,8 @@ struct Shared {
     out: Mutex<Option<mpsc::UnboundedSender<Message>>>,
     routes: Arc<Mutex<Routes>>,
     ha_version: RwLock<String>,
+    /// The published [`ConnectionState`]; every transition lands here.
+    state: watch::Sender<ConnectionState>,
 }
 
 #[derive(Default)]
@@ -213,6 +215,32 @@ impl From<String> for TokenProvider {
     }
 }
 
+/// Where the connection behind a [`HaClient`] stands, streamed through
+/// [`HaClient::connection_state`].
+///
+/// A client built with [`HaClient::connect_with_retry`] moves `Connected` →
+/// [`Reconnecting`](Self::Reconnecting) when the socket drops, back to
+/// `Connected` once a reconnect succeeds, and to a terminal state when it
+/// cannot go on. A client built with [`HaClient::connect`] only ever reports
+/// `Connected`, then `Stopped`.
+#[derive(Debug)]
+pub enum ConnectionState {
+    /// The socket is up and authenticated.
+    Connected,
+    /// The socket dropped and the client is between connections. `attempt`
+    /// counts the reconnects that have failed in this outage; `last_error`
+    /// is why the latest one failed — [`Error::TokenProvider`] when the
+    /// provider is the part that is down — or [`Error::Disconnected`] while
+    /// the first attempt is still in flight.
+    Reconnecting { attempt: u64, last_error: Error },
+    /// The credential was refused and the [`TokenProvider`] had nothing
+    /// different to offer; the client will not try again. Terminal.
+    AuthRejected(Error),
+    /// The client shut down: every handle was dropped or, on a client built
+    /// with [`HaClient::connect`], the socket closed. Terminal.
+    Stopped,
+}
+
 /// Why a `run_connection` task stopped.
 enum ConnEnd {
     /// The socket closed or errored; a supervised client should reconnect.
@@ -279,6 +307,12 @@ impl HaClient {
     /// refusal final: a wrong token is returned immediately here, and on
     /// reconnect it stops the client for good. A provider that fails counts
     /// as an ordinary failed attempt and is retried.
+    ///
+    /// [`HaClient::connection_state`] follows the lifecycle this starts:
+    /// [`ConnectionState::Reconnecting`] while a reconnect is in flight —
+    /// with the last failure, so a failing [`TokenProvider`] shows up as
+    /// [`Error::TokenProvider`] — then `Connected` again, or the terminal
+    /// [`ConnectionState::AuthRejected`] and [`ConnectionState::Stopped`].
     pub async fn connect_with_retry(
         url: &str,
         token: impl Into<TokenProvider>,
@@ -292,14 +326,22 @@ impl HaClient {
     /// supervised, so its subscriptions survive for replay.
     fn assemble(ws: WsStream, ha_version: String, done: Option<oneshot::Sender<ConnEnd>>) -> Self {
         let (out, out_rx) = mpsc::unbounded_channel();
+        let (state, _) = watch::channel(ConnectionState::Connected);
         let routes = Arc::new(Mutex::new(Routes::default()));
-        tokio::spawn(run_connection(ws, out_rx, routes.clone(), done));
+        tokio::spawn(run_connection(
+            ws,
+            out_rx,
+            routes.clone(),
+            state.clone(),
+            done,
+        ));
         HaClient {
             shared: Arc::new(Shared {
                 next_id: AtomicU64::new(1),
                 out: Mutex::new(Some(out)),
                 routes,
                 ha_version: RwLock::new(ha_version),
+                state,
             }),
         }
     }
@@ -319,6 +361,21 @@ impl HaClient {
     /// The Home Assistant version of the current connection.
     pub fn ha_version(&self) -> String {
         self.shared.ha_version.read().unwrap().clone()
+    }
+
+    /// The connection's state, live: the receiver sees the current
+    /// [`ConnectionState`] immediately and every transition after.
+    ///
+    /// Subscribe before dropping the last client handle to observe
+    /// [`ConnectionState::Stopped`]. On a client built with
+    /// [`HaClient::connect_with_retry`] the state is
+    /// [`ConnectionState::Reconnecting`] while the supervisor re-dials and
+    /// the terminal [`ConnectionState::AuthRejected`] once a credential is
+    /// refused for good — a [`Error::TokenProvider`] in
+    /// `Reconnecting::last_error` says the provider, not the network, is
+    /// what is failing.
+    pub fn connection_state(&self) -> watch::Receiver<ConnectionState> {
+        self.shared.state.subscribe()
     }
 
     /// Sends a raw command and returns its `result`. The `id` field is filled in.
@@ -731,11 +788,15 @@ impl EntityWatcher {
 
 /// Runs one socket's I/O until it dies or every client handle is gone.
 /// `done` reports which; `Some` means a supervisor is listening, so the
-/// subscription routes are left standing for the next connection to replay.
+/// subscription routes are left standing for the next connection to replay
+/// and the supervisor publishes what the state becomes. Without one this
+/// task is the last word, so it publishes [`ConnectionState::Stopped`]
+/// itself.
 async fn run_connection(
     mut ws: WsStream,
     mut out_rx: mpsc::UnboundedReceiver<Message>,
     routes: Arc<Mutex<Routes>>,
+    state: watch::Sender<ConnectionState>,
     done: Option<oneshot::Sender<ConnEnd>>,
 ) {
     let mut end = ConnEnd::Lost;
@@ -775,8 +836,13 @@ async fn run_connection(
         routes.subscriptions.clear();
     }
     drop(routes);
-    if let Some(done) = done {
-        let _ = done.send(end);
+    match done {
+        Some(done) => {
+            let _ = done.send(end);
+        }
+        None => {
+            state.send_replace(ConnectionState::Stopped);
+        }
     }
 }
 
@@ -792,29 +858,41 @@ async fn supervise(
     connect_timeout: Duration,
     mut done: oneshot::Receiver<ConnEnd>,
 ) {
-    let routes = match weak.upgrade() {
-        Some(shared) => shared.routes.clone(),
+    let (routes, state) = match weak.upgrade() {
+        Some(shared) => (shared.routes.clone(), shared.state.clone()),
         None => return,
     };
     let mut backoff = policy.backoff();
     let mut connected_at = Instant::now();
     loop {
         match done.await {
-            Err(_) | Ok(ConnEnd::Shutdown) => return,
-            Ok(ConnEnd::Lost) => {}
+            Err(_) | Ok(ConnEnd::Shutdown) => {
+                state.send_replace(ConnectionState::Stopped);
+                return;
+            }
+            Ok(ConnEnd::Lost) => {
+                state.send_replace(ConnectionState::Reconnecting {
+                    attempt: 0,
+                    last_error: Error::Disconnected,
+                });
+            }
         }
         // Only a session that stayed up counts as a success; quick deaths
         // keep doubling so a flapping server is not hammered.
         if connected_at.elapsed() >= policy.stable {
             backoff.reset();
         }
+        // Reconnects that have failed since the link went down.
+        let mut attempt = 0;
         loop {
             let delay = backoff.next().unwrap_or(policy.max);
             tracing::debug!("reconnecting to Home Assistant in {delay:?}");
             tokio::time::sleep(delay).await;
             let Some(shared) = weak.upgrade() else {
+                state.send_replace(ConnectionState::Stopped);
                 return;
             };
+            attempt += 1;
             match connect_attempt(&url, &mut provider, connect_timeout).await {
                 Attempt::Connected(ws, ha_version) => {
                     *shared.ha_version.write().unwrap() = ha_version;
@@ -822,10 +900,17 @@ async fn supervise(
                     let (done_tx, done_rx) = oneshot::channel();
                     *shared.out.lock().unwrap() = Some(out);
                     routes.lock().unwrap().closed = false;
-                    tokio::spawn(run_connection(*ws, out_rx, routes.clone(), Some(done_tx)));
+                    tokio::spawn(run_connection(
+                        *ws,
+                        out_rx,
+                        routes.clone(),
+                        state.clone(),
+                        Some(done_tx),
+                    ));
                     let client = HaClient { shared };
                     client.negotiate_features(connect_timeout).await;
                     resubscribe(&client).await;
+                    state.send_replace(ConnectionState::Connected);
                     tracing::info!("reconnected to Home Assistant");
                     done = done_rx;
                     connected_at = Instant::now();
@@ -833,9 +918,16 @@ async fn supervise(
                 }
                 Attempt::Rejected(e) => {
                     tracing::warn!("authentication rejected on reconnect: {e}");
+                    state.send_replace(ConnectionState::AuthRejected(e));
                     return;
                 }
-                Attempt::Failed(e) => tracing::warn!("reconnect failed: {e}"),
+                Attempt::Failed(e) => {
+                    tracing::warn!("reconnect failed: {e}");
+                    state.send_replace(ConnectionState::Reconnecting {
+                        attempt,
+                        last_error: e,
+                    });
+                }
             }
         }
     }
