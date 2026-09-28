@@ -1,6 +1,8 @@
 //! Connection, authentication, and request/subscription routing.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
@@ -133,6 +135,84 @@ impl Iterator for Backoff {
     }
 }
 
+/// The future a [`TokenProvider`] produces.
+type TokenFut = Pin<Box<dyn Future<Output = Result<String>> + Send>>;
+
+/// Produces the access token each connect attempt authenticates with.
+///
+/// [`HaClient::connect_with_retry`] consults the provider before the initial
+/// connect and before every reconnect, so a client enrolled through OAuth —
+/// whose access tokens expire — can refresh them instead of replaying one
+/// that has died. `&str` and `String` convert into a provider that always
+/// yields the same token, which is all a long-lived token needs.
+///
+/// When a token is refused, the provider is consulted once more on that
+/// attempt: a *different* token earns one immediate retry in place, while the
+/// same token again — all a fixed `&str` provider can offer — makes the
+/// refusal final. An error (the refresh endpoint is down, the refresh token
+/// was revoked) is an ordinary failed attempt that the retry loop paces, not
+/// a refused credential. Consultations are bounded by the connect timeout
+/// like the rest of the handshake.
+///
+/// ```no_run
+/// # async fn demo() -> ha_core::Result<()> {
+/// let provider = ha_core::TokenProvider::new(|| async {
+///     refresh_oauth_token().await
+/// });
+/// let client = ha_core::HaClient::connect_with_retry(
+///     "http://homeassistant.local:8123",
+///     provider,
+///     ha_core::RetryPolicy::default(),
+/// )
+/// .await?;
+/// # Ok(())
+/// # }
+/// # async fn refresh_oauth_token() -> Result<String, std::io::Error> {
+/// #     Ok("…".into())
+/// # }
+/// ```
+pub struct TokenProvider(Box<dyn FnMut() -> TokenFut + Send>);
+
+impl TokenProvider {
+    /// Wraps the callable consulted for a token before each connect attempt,
+    /// e.g. one that refreshes an OAuth token when it is near expiry. The
+    /// error only has to convert into `Box<dyn Error + Send + Sync>`: any
+    /// [`std::error::Error`] qualifies, as do `String` and `anyhow::Error`.
+    pub fn new<F, Fut, E>(mut produce: F) -> Self
+    where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: Future<Output = std::result::Result<String, E>> + Send + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        TokenProvider(Box::new(move || {
+            let token = produce();
+            Box::pin(async move { token.await.map_err(|e| Error::TokenProvider(e.into())) })
+        }))
+    }
+
+    /// The token for the next attempt, bounded by `deadline`.
+    async fn token(&mut self, deadline: Duration) -> Result<String> {
+        tokio::time::timeout(deadline, (self.0)())
+            .await
+            .map_err(|_| Error::Timeout)?
+    }
+}
+
+impl<T: AsRef<str> + ?Sized> From<&T> for TokenProvider {
+    fn from(token: &T) -> Self {
+        token.as_ref().to_owned().into()
+    }
+}
+
+impl From<String> for TokenProvider {
+    fn from(token: String) -> Self {
+        TokenProvider::new(move || {
+            let token = token.clone();
+            async move { Ok::<_, std::convert::Infallible>(token) }
+        })
+    }
+}
+
 /// Why a `run_connection` task stopped.
 enum ConnEnd {
     /// The socket closed or errored; a supervised client should reconnect.
@@ -187,16 +267,24 @@ impl HaClient {
     /// as a failed attempt and is retried; it never stalls the loop. Use
     /// [`HaClientBuilder::connect_with_retry`] to change the deadline.
     ///
-    /// [`Error::AuthInvalid`] is never retried: a wrong token is returned
-    /// immediately here, and on reconnect it stops the client for good.
+    /// `token` is a `&str`/`String` holding a long-lived access token, or a
+    /// [`TokenProvider`] consulted before every attempt — the OAuth case,
+    /// where the token minted at connect time expires before a later
+    /// reconnect and must be refreshed.
+    ///
+    /// A refused token ([`Error::AuthInvalid`]) earns the provider one more
+    /// consultation on that attempt: a *different* token is tried once, in
+    /// place, so a freshly refreshed token still connects. A provider that
+    /// repeats the refused token — as every fixed `&str` does — makes the
+    /// refusal final: a wrong token is returned immediately here, and on
+    /// reconnect it stops the client for good. A provider that fails counts
+    /// as an ordinary failed attempt and is retried.
     pub async fn connect_with_retry(
         url: &str,
-        access_token: &str,
+        token: impl Into<TokenProvider>,
         policy: RetryPolicy,
     ) -> Result<Self> {
-        Self::builder()
-            .connect_with_retry(url, access_token, policy)
-            .await
+        Self::builder().connect_with_retry(url, token, policy).await
     }
 
     /// Builds the shared state and spawns the connection's I/O task.
@@ -465,21 +553,22 @@ impl HaClientBuilder {
     pub async fn connect_with_retry(
         self,
         url: &str,
-        access_token: &str,
+        token: impl Into<TokenProvider>,
         policy: RetryPolicy,
     ) -> Result<HaClient> {
         let deadline = self.connect_timeout;
         let url = websocket_url(url)?;
+        let mut provider = token.into();
         let mut backoff = policy.backoff();
         loop {
-            match handshake(&url, access_token, deadline).await {
-                Ok((ws, ha_version)) => {
+            match connect_attempt(&url, &mut provider, deadline).await {
+                Attempt::Connected(ws, ha_version) => {
                     let (done, done_rx) = oneshot::channel();
-                    let client = HaClient::assemble(ws, ha_version, Some(done));
+                    let client = HaClient::assemble(*ws, ha_version, Some(done));
                     tokio::spawn(supervise(
                         Arc::downgrade(&client.shared),
                         url.clone(),
-                        access_token.to_owned(),
+                        provider,
                         policy,
                         deadline,
                         done_rx,
@@ -487,9 +576,9 @@ impl HaClientBuilder {
                     client.negotiate_features(deadline).await;
                     return Ok(client);
                 }
-                // A bad token can never succeed; everything else may.
-                Err(e @ Error::AuthInvalid(_)) => return Err(e),
-                Err(e) => {
+                // A refused credential can only be refused again.
+                Attempt::Rejected(e) => return Err(e),
+                Attempt::Failed(e) => {
                     let delay = backoff.next().unwrap_or(policy.max);
                     tracing::warn!("connect failed: {e}; retrying in {delay:?}");
                     tokio::time::sleep(delay).await;
@@ -698,7 +787,7 @@ async fn run_connection(
 async fn supervise(
     weak: Weak<Shared>,
     url: Url,
-    access_token: String,
+    mut provider: TokenProvider,
     policy: RetryPolicy,
     connect_timeout: Duration,
     mut done: oneshot::Receiver<ConnEnd>,
@@ -726,14 +815,14 @@ async fn supervise(
             let Some(shared) = weak.upgrade() else {
                 return;
             };
-            match handshake(&url, &access_token, connect_timeout).await {
-                Ok((ws, ha_version)) => {
+            match connect_attempt(&url, &mut provider, connect_timeout).await {
+                Attempt::Connected(ws, ha_version) => {
                     *shared.ha_version.write().unwrap() = ha_version;
                     let (out, out_rx) = mpsc::unbounded_channel();
                     let (done_tx, done_rx) = oneshot::channel();
                     *shared.out.lock().unwrap() = Some(out);
                     routes.lock().unwrap().closed = false;
-                    tokio::spawn(run_connection(ws, out_rx, routes.clone(), Some(done_tx)));
+                    tokio::spawn(run_connection(*ws, out_rx, routes.clone(), Some(done_tx)));
                     let client = HaClient { shared };
                     client.negotiate_features(connect_timeout).await;
                     resubscribe(&client).await;
@@ -742,11 +831,11 @@ async fn supervise(
                     connected_at = Instant::now();
                     break;
                 }
-                Err(Error::AuthInvalid(e)) => {
+                Attempt::Rejected(e) => {
                     tracing::warn!("authentication rejected on reconnect: {e}");
                     return;
                 }
-                Err(e) => tracing::warn!("reconnect failed: {e}"),
+                Attempt::Failed(e) => tracing::warn!("reconnect failed: {e}"),
             }
         }
     }
@@ -864,6 +953,47 @@ fn dispatch(routes: &Mutex<Routes>, text: &str) {
             }
             other => tracing::debug!("ignoring {other:?}"),
         }
+    }
+}
+
+/// How one connect attempt on a [`TokenProvider`] ended.
+enum Attempt {
+    /// Authenticated: the socket and the Home Assistant version it reported.
+    /// Boxed so the common `Failed`/`Rejected` path stays small.
+    Connected(Box<WsStream>, String),
+    /// The token was refused and the provider had nothing different to offer,
+    /// or its replacement was refused too. Retrying can only repeat it.
+    Rejected(Error),
+    /// Anything else — transport, timeout, or the provider itself. The retry
+    /// loop paces the next attempt.
+    Failed(Error),
+}
+
+/// One connect attempt: authenticate with the token `provider` currently
+/// yields, and when it is refused give the provider one chance to name a
+/// different token for an in-place retry — the refresh of an expired OAuth
+/// token. A provider that repeats the refused token (as a fixed `&str` always
+/// does) or whose replacement is refused too ends the attempt `Rejected`,
+/// so a wrong fixed token still fails exactly like before; a provider error
+/// is an ordinary failed attempt, not a refusal.
+async fn connect_attempt(url: &Url, provider: &mut TokenProvider, deadline: Duration) -> Attempt {
+    let token = match provider.token(deadline).await {
+        Ok(token) => token,
+        Err(e) => return Attempt::Failed(e),
+    };
+    match handshake(url, &token, deadline).await {
+        Ok((ws, ha_version)) => Attempt::Connected(Box::new(ws), ha_version),
+        Err(e @ Error::AuthInvalid(_)) => match provider.token(deadline).await {
+            Ok(fresh) if fresh != token => match handshake(url, &fresh, deadline).await {
+                Ok((ws, ha_version)) => Attempt::Connected(Box::new(ws), ha_version),
+                Err(e @ Error::AuthInvalid(_)) => Attempt::Rejected(e),
+                Err(e) => Attempt::Failed(e),
+            },
+            // The provider has nothing better than the refused token.
+            Ok(_) => Attempt::Rejected(e),
+            Err(e) => Attempt::Failed(e),
+        },
+        Err(e) => Attempt::Failed(e),
     }
 }
 

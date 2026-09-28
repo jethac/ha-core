@@ -8,6 +8,8 @@
 //!   which yields batches of [`EntityChange`]s that a front end can apply to its models,
 //! - opt-in reconnect: [`HaClient::connect_with_retry`] re-dials with capped
 //!   exponential backoff and re-issues live subscriptions after each drop.
+//!   Pass a [`TokenProvider`] instead of a `&str` token to refresh expiring
+//!   OAuth access tokens between attempts.
 //!
 //! ```no_run
 //! # async fn demo() -> ha_core::Result<()> {
@@ -28,7 +30,9 @@ mod error;
 mod protocol;
 mod registry;
 
-pub use client::{EntityWatcher, HaClient, HaClientBuilder, RetryPolicy, Subscription, Target};
+pub use client::{
+    EntityWatcher, HaClient, HaClientBuilder, RetryPolicy, Subscription, Target, TokenProvider,
+};
 pub use entities::{EntityChange, EntityState, EntityStore, domain_of};
 pub use error::{Error, Result};
 pub use registry::{AreaEntry, DeviceEntry, EntityRegistryEntry};

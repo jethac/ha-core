@@ -12,6 +12,11 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("authentication rejected: {0}")]
     AuthInvalid(String),
+    /// A [`TokenProvider`](crate::TokenProvider) failed to produce a token —
+    /// e.g. the refresh endpoint was unreachable or the refresh token was
+    /// revoked. Counts as a failed connect attempt, not a refused credential.
+    #[error("token provider failed: {0}")]
+    TokenProvider(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("protocol error: {0}")]
     Protocol(String),
     /// Home Assistant answered a command with `success: false`.
