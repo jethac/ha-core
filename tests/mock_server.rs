@@ -1,11 +1,11 @@
 //! End-to-end tests against a scripted stand-in for Home Assistant's WebSocket API.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use ha_core::{EntityChange, Error, HaClient, RetryPolicy, Target};
+use ha_core::{EntityChange, Error, HaClient, RetryPolicy, Target, TokenProvider};
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::WebSocketStream;
@@ -174,7 +174,13 @@ async fn serve_reconnectable(mut ws: WebSocketStream<TcpStream>) {
         json!({"type": "auth_ok", "ha_version": "2026.9.0"}),
     )
     .await;
+    serve_session(ws).await;
+}
 
+/// The post-auth command loop shared by the reconnectable mocks: `ping`
+/// answers then drops the socket, `subscribe_entities` replays a snapshot,
+/// and `call_service` toggles `light.kitchen`.
+async fn serve_session(mut ws: WebSocketStream<TcpStream>) {
     let mut kitchen_on = true;
     let mut entity_sub: Option<Value> = None;
     while let Some(msg) = recv(&mut ws).await {
@@ -439,4 +445,205 @@ async fn reconnect_gives_up_on_a_stalled_attempt() {
     .await
     .expect("supervisor stalled on an unresponsive reconnect");
     assert!(matches!(&resynced[..], [EntityChange::Added(s)] if s.is_on()));
+}
+
+/// Like `mock_reconnectable_home_assistant`, but the token it accepts lives in
+/// `valid`, which the test can rotate between connections, and every token a
+/// connection presents is recorded in `presented`.
+async fn mock_rotating_auth_home_assistant(
+    initial: &str,
+) -> (String, Arc<Mutex<String>>, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let valid = Arc::new(Mutex::new(initial.to_owned()));
+    let presented = Arc::new(Mutex::new(Vec::new()));
+    tokio::spawn({
+        let valid = valid.clone();
+        let presented = presented.clone();
+        async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let valid = valid.clone();
+                let presented = presented.clone();
+                tokio::spawn(async move {
+                    let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    send(
+                        &mut ws,
+                        json!({"type": "auth_required", "ha_version": "2026.9.0"}),
+                    )
+                    .await;
+                    let auth = recv(&mut ws).await.unwrap();
+                    let token = auth["access_token"].as_str().unwrap_or_default().to_owned();
+                    presented.lock().unwrap().push(token.clone());
+                    if token != *valid.lock().unwrap() {
+                        send(
+                            &mut ws,
+                            json!({"type": "auth_invalid", "message": "Invalid access token"}),
+                        )
+                        .await;
+                        return;
+                    }
+                    send(
+                        &mut ws,
+                        json!({"type": "auth_ok", "ha_version": "2026.9.0"}),
+                    )
+                    .await;
+                    serve_session(ws).await;
+                });
+            }
+        }
+    });
+    (format!("http://{addr}"), valid, presented)
+}
+
+/// Waits until `presented` has recorded at least `n` auth tokens.
+async fn presented_tokens(presented: &Mutex<Vec<String>>, n: usize) -> Vec<String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        {
+            let tokens = presented.lock().unwrap();
+            if tokens.len() >= n {
+                return tokens.clone();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {n} auth attempts"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A provider is consulted before every attempt, so a token rotated while the
+/// client was connected still authenticates the reconnect.
+#[tokio::test]
+async fn retry_reconnects_with_a_refreshed_token() {
+    let (url, valid, presented) = mock_rotating_auth_home_assistant("token-one").await;
+    let mut tokens = ["token-one", "token-two"].into_iter();
+    let provider = TokenProvider::new(move || {
+        let token = tokens.next().unwrap_or("token-two").to_owned();
+        async move { Ok::<_, std::convert::Infallible>(token) }
+    });
+    let client = HaClient::connect_with_retry(&url, provider, fast_retry())
+        .await
+        .unwrap();
+
+    // The first token expires while the client is connected; the socket drops.
+    *valid.lock().unwrap() = "token-two".to_owned();
+    client.ping().await.unwrap();
+
+    assert_eq!(
+        presented_tokens(&presented, 2).await,
+        ["token-one", "token-two"],
+        "the reconnect must authenticate with the provider's fresh token"
+    );
+    client.toggle("light.kitchen").await.unwrap();
+}
+
+/// A refused token earns the provider one more consultation on that attempt;
+/// a fresh token is tried in place, on the initial connect and on reconnect.
+#[tokio::test]
+async fn retry_refreshes_a_refused_token_once_per_attempt() {
+    let (url, valid, presented) = mock_rotating_auth_home_assistant("fresh-one").await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counting = calls.clone();
+    let mut tokens = ["stale-one", "fresh-one", "stale-two", "fresh-two"].into_iter();
+    let provider = TokenProvider::new(move || {
+        counting.fetch_add(1, Ordering::Relaxed);
+        let token = tokens.next().unwrap_or("fresh-two").to_owned();
+        async move { Ok::<_, std::convert::Infallible>(token) }
+    });
+    let client = HaClient::connect_with_retry(&url, provider, fast_retry())
+        .await
+        .unwrap();
+    // Initial connect: stale-one refused, fresh-one tried in place.
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+    *valid.lock().unwrap() = "fresh-two".to_owned();
+    client.ping().await.unwrap(); // answers, then drops the socket
+
+    assert_eq!(
+        presented_tokens(&presented, 4).await,
+        ["stale-one", "fresh-one", "stale-two", "fresh-two"],
+        "reconnect must re-consult the provider once when the token is refused"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 4);
+    client.toggle("light.kitchen").await.unwrap();
+}
+
+/// A provider with nothing better than the refused token fails the initial
+/// connect with `AuthInvalid` instead of retrying it forever.
+#[tokio::test]
+async fn retry_gives_up_when_provider_cannot_refresh() {
+    let (url, _valid, presented) = mock_rotating_auth_home_assistant(TOKEN).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counting = calls.clone();
+    let provider = TokenProvider::new(move || {
+        counting.fetch_add(1, Ordering::Relaxed);
+        async { Ok::<_, std::convert::Infallible>("stale".to_owned()) }
+    });
+    let result = HaClient::connect_with_retry(&url, provider, fast_retry()).await;
+    assert!(matches!(result, Err(Error::AuthInvalid(_))));
+    // One attempt: consult, refuse, one more consult, stop.
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert_eq!(presented.lock().unwrap()[..], ["stale"]);
+}
+
+/// A fixed `&str` token can never produce a different one: a refused token is
+/// still returned immediately rather than retried.
+#[tokio::test]
+async fn retry_gives_up_on_a_refused_fixed_token() {
+    let (url, _valid, presented) = mock_rotating_auth_home_assistant(TOKEN).await;
+    let result = HaClient::connect_with_retry(&url, "stale", fast_retry()).await;
+    assert!(matches!(result, Err(Error::AuthInvalid(_))));
+    // The one re-consultation yields the same token, so no second handshake.
+    assert_eq!(presented.lock().unwrap()[..], ["stale"]);
+}
+
+/// A provider that fails is a failed attempt, not a refused token: the loop
+/// paces the next attempt instead of giving up.
+#[tokio::test]
+async fn retry_retries_a_failing_provider() {
+    let (url, _valid, presented) = mock_rotating_auth_home_assistant("fresh").await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counting = calls.clone();
+    let provider = TokenProvider::new(move || {
+        let n = counting.fetch_add(1, Ordering::Relaxed);
+        async move {
+            if n == 0 {
+                Err(std::io::Error::other("refresh endpoint unreachable"))
+            } else {
+                Ok("fresh".to_owned())
+            }
+        }
+    });
+    let client = HaClient::connect_with_retry(&url, provider, fast_retry())
+        .await
+        .unwrap();
+    client.ping().await.unwrap();
+    assert!(calls.load(Ordering::Relaxed) >= 2);
+    assert_eq!(presented.lock().unwrap()[..], ["fresh"]);
+}
+
+/// A refused reconnect whose provider can only repeat the token stops the
+/// client for good — the fixed-token contract survives providers.
+#[tokio::test]
+async fn reconnect_refusal_with_no_fresh_token_stops_the_client() {
+    let (url, valid, presented) = mock_rotating_auth_home_assistant(TOKEN).await;
+    let provider =
+        TokenProvider::new(|| async { Ok::<_, std::convert::Infallible>(TOKEN.to_owned()) });
+    let client = HaClient::connect_with_retry(&url, provider, fast_retry())
+        .await
+        .unwrap();
+    client.ping().await.unwrap(); // answers, then drops the socket
+    *valid.lock().unwrap() = "rotated".to_owned(); // TOKEN is refused now
+
+    // The refused reconnect is seen, the provider re-consulted once, and the
+    // supervisor exits: nothing is presented again once it has had time to.
+    assert_eq!(presented_tokens(&presented, 2).await, [TOKEN, TOKEN]);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        matches!(client.ping().await, Err(Error::Disconnected)),
+        "a refused reconnect must stop the client"
+    );
+    assert_eq!(presented.lock().unwrap()[..], [TOKEN, TOKEN]);
 }
