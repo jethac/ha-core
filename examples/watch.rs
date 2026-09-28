@@ -2,14 +2,19 @@
 //!
 //! HA_URL=http://homeassistant.local:8123 HA_TOKEN=… cargo run --example watch [entity_id…]
 
-use ha_core::{EntityChange, HaClient};
+use ha_core::{EntityChange, HaClient, RetryPolicy};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    let client = HaClient::connect(&std::env::var("HA_URL")?, &std::env::var("HA_TOKEN")?).await?;
+    let client = HaClient::connect_with_retry(
+        &std::env::var("HA_URL")?,
+        &std::env::var("HA_TOKEN")?,
+        RetryPolicy::default(),
+    )
+    .await?;
     println!("connected to Home Assistant {}", client.ha_version());
 
     let filter: Vec<String> = std::env::args().skip(1).collect();
